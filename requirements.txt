@@ -1,0 +1,8 @@
+mlx
+mlx-lm
+mlx-audio[stt,tts]
+numpy
+numba
+webrtcvad
+pyaudio
+websockets
