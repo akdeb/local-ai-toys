@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import sys
 from contextlib import asynccontextmanager
 
@@ -11,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from mlx_lm.generate import generate as generate_text
+from mlx_lm.generate import generate_step
 from mlx_lm.utils import load as load_llm
 
 from mlx_audio.stt.models.whisper import Model as Whisper
@@ -114,13 +115,11 @@ class VoicePipeline:
             result = await asyncio.to_thread(self.stt.generate, mx.array(audio))
         return result.text.strip()
 
-    async def generate_response(self, text: str) -> str:
-        def _get_llm_response(llm, tokenizer, messages, *, verbose=False):
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            return generate_text(llm, tokenizer, prompt, verbose=verbose).strip()
-
+    async def generate_response_sentences(self, text: str, cancel_event: asyncio.Event = None):
+        """
+        Async generator that yields sentences one at a time as the LLM generates them.
+        Implements sentence-by-sentence alternation for lower latency.
+        """
         messages = [
             {
                 "role": "system",
@@ -132,11 +131,108 @@ class VoicePipeline:
             },
             {"role": "user", "content": text},
         ]
-        async with self.mlx_lock:
-            response_text = await asyncio.to_thread(
-                _get_llm_response, self.llm, self.tokenizer, messages, verbose=False
-            )
-        return response_text
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Sentence boundary pattern
+        sentence_end_pattern = re.compile(r'(?<=[.!?])\s+')
+
+        buffer = ""
+        full_response = ""
+
+        def _make_sampler(temperature: float):
+            def _sampler(logits: mx.array) -> mx.array:
+                if temperature == 0.0:
+                    return mx.argmax(logits, axis=-1)
+                return mx.random.categorical(logits / temperature)
+
+            return _sampler
+
+        # Build eos id set robustly across tokenizer implementations
+        eos_ids = set()
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            eos_ids.add(int(eos_token_id))
+        eos_token_ids = getattr(self.tokenizer, "eos_token_ids", None)
+        if eos_token_ids:
+            eos_ids.update(int(x) for x in eos_token_ids)
+
+        token_generator = None
+        finished = False
+
+        while True:
+            if cancel_event and cancel_event.is_set():
+                break
+
+            # If buffer already contains a sentence from a previous overrun, emit it without generating.
+            parts = sentence_end_pattern.split(buffer, maxsplit=1)
+            if len(parts) > 1:
+                sentence = parts[0].strip()
+                buffer = parts[1] if len(parts) > 1 else ""
+                if sentence:
+                    yield sentence
+                continue
+
+            if finished:
+                break
+
+            sentence_to_yield = None
+
+            # Generate until we hit a sentence boundary, but ONLY while holding the MLX lock.
+            async with self.mlx_lock:
+                if token_generator is None:
+                    prompt_tokens = self.tokenizer.encode(prompt)
+                    prompt_tokens = mx.array(prompt_tokens)
+                    token_generator = generate_step(
+                        prompt_tokens,
+                        self.llm,
+                        max_tokens=512,
+                        sampler=_make_sampler(0.7),
+                    )
+
+                while True:
+                    try:
+                        token, _logprobs = next(token_generator)
+                    except StopIteration:
+                        finished = True
+                        break
+
+                    # Handle both mx.array and plain int returns
+                    if hasattr(token, 'item'):
+                        token_id = int(token.item())
+                    else:
+                        token_id = int(token)
+
+                    if eos_ids and token_id in eos_ids:
+                        finished = True
+                        break
+
+                    token_str = self.tokenizer.decode([token_id])
+                    buffer += token_str
+                    full_response += token_str
+
+                    parts = sentence_end_pattern.split(buffer, maxsplit=1)
+                    if len(parts) > 1:
+                        sentence_to_yield = parts[0].strip()
+                        buffer = parts[1] if len(parts) > 1 else ""
+                        break
+
+            if sentence_to_yield:
+                yield sentence_to_yield
+
+        if buffer.strip():
+            yield buffer.strip()
+
+        logger.info(f"Full response: {full_response.strip()}")
+
+    async def generate_response(self, text: str) -> str:
+        """Legacy method - generates full response at once."""
+        sentences = []
+        async for sentence in self.generate_response_sentences(text):
+            sentences.append(sentence)
+        return " ".join(sentences)
 
     async def synthesize_speech(self, text: str, cancel_event: asyncio.Event = None):
         """
@@ -286,32 +382,67 @@ async def websocket_endpoint(websocket: WebSocket):
                             json.dumps({"type": "transcription", "text": transcription})
                         )
 
-                        logger.info("Generating response...")
-                        response_text = await pipeline.generate_response(transcription)
-                        logger.info(f"Response: {response_text}")
-
-                        await websocket.send_text(
-                            json.dumps({"type": "response", "text": response_text})
-                        )
-
                         cancel_event.clear()
 
-                        async def stream_audio():
-                            buffered = bytearray()
-                            started = False
-
-                            async for audio_chunk in pipeline.synthesize_speech(
-                                response_text, cancel_event
+                        # ✅ Sentence-by-sentence alternation:
+                        # Generate sentence 1 → Speak sentence 1 → Generate sentence 2 → Speak sentence 2 → ...
+                        async def stream_sentences():
+                            sentence_num = 0
+                            async for sentence in pipeline.generate_response_sentences(
+                                transcription, cancel_event
                             ):
                                 if cancel_event.is_set():
                                     break
 
-                                if not started:
-                                    buffered.extend(audio_chunk)
-                                    if len(buffered) < PREBUFFER_BYTES:
-                                        continue
+                                sentence_num += 1
+                                logger.info(f"Sentence {sentence_num}: {sentence}")
 
-                                    # Send the buffered audio as the first payload
+                                # Send the sentence text to client
+                                await websocket.send_text(
+                                    json.dumps({"type": "response", "text": sentence})
+                                )
+
+                                # Immediately TTS this sentence
+                                buffered = bytearray()
+                                started = False
+
+                                async for audio_chunk in pipeline.synthesize_speech(
+                                    sentence, cancel_event
+                                ):
+                                    if cancel_event.is_set():
+                                        break
+
+                                    if not started:
+                                        buffered.extend(audio_chunk)
+                                        if len(buffered) < PREBUFFER_BYTES:
+                                            continue
+
+                                        await websocket.send_text(
+                                            json.dumps(
+                                                {
+                                                    "type": "audio",
+                                                    "data": base64.b64encode(
+                                                        bytes(buffered)
+                                                    ).decode("utf-8"),
+                                                }
+                                            )
+                                        )
+                                        buffered.clear()
+                                        started = True
+                                    else:
+                                        await websocket.send_text(
+                                            json.dumps(
+                                                {
+                                                    "type": "audio",
+                                                    "data": base64.b64encode(
+                                                        audio_chunk
+                                                    ).decode("utf-8"),
+                                                }
+                                            )
+                                        )
+
+                                # Flush any remaining buffered audio for this sentence
+                                if buffered:
                                     await websocket.send_text(
                                         json.dumps(
                                             {
@@ -322,23 +453,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                             }
                                         )
                                     )
-                                    buffered.clear()
-                                    started = True
-                                else:
-                                    await websocket.send_text(
-                                        json.dumps(
-                                            {
-                                                "type": "audio",
-                                                "data": base64.b64encode(
-                                                    audio_chunk
-                                                ).decode("utf-8"),
-                                            }
-                                        )
-                                    )
 
                             await websocket.send_text(json.dumps({"type": "audio_end"}))
 
-                        current_tts_task = asyncio.create_task(stream_audio())
+                        current_tts_task = asyncio.create_task(stream_sentences())
 
             elif msg_type == "cancel":
                 if current_tts_task and not current_tts_task.done():
