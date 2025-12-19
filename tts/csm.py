@@ -53,6 +53,7 @@ class CSMTTS(BaseTTS):
             "stream": True,
             "streaming_interval": self.streaming_interval,
             "verbose": False,
+            "split_pattern": r"[.!?]+",  # Split on sentence endings to avoid duration limit
         }
         if self.ref_audio is not None:
             generate_kwargs["ref_audio"] = self.ref_audio

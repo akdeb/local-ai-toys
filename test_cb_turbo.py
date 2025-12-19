@@ -32,7 +32,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="cb_turbo_output2.wav",
+        default="cb_turbo_output3.wav",
         help="Output WAV file path",
     )
     parser.add_argument(

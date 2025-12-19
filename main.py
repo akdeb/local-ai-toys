@@ -16,12 +16,106 @@ from mlx_lm.generate import generate_step
 from mlx_lm.utils import load as load_llm
 
 from mlx_audio.stt.models.whisper import Model as Whisper
-from tts import ChatterboxTTS, CSMTTS, KokoroTTS
+from tts import ChatterboxTTS, CSMTTS, KokoroTTS, VoxCPMTTS
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+# --- Text Chunking for TTS ---
+from typing import List, Tuple
+
+
+def _preprocess_and_segment_text(text: str) -> List[Tuple[str, str]]:
+    """
+    Preprocess text and segment it into sentences.
+    Returns list of (segment_type, segment_text) tuples.
+    """
+    if not text or text.isspace():
+        return []
+    
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text.strip())
+    
+    # Split on sentence boundaries while keeping the delimiter
+    # This regex splits on .!? followed by space or end of string
+    sentence_pattern = r'(?<=[.!?])\s+'
+    sentences = re.split(sentence_pattern, text)
+    
+    # Filter empty and return as tuples
+    result = []
+    for s in sentences:
+        s = s.strip()
+        if s:
+            result.append(("sentence", s))
+    
+    return result
+
+
+def chunk_text_by_characters(
+    full_text: str,
+    chunk_size: int = 200,
+) -> List[str]:
+    """
+    Chunks text into manageable pieces for TTS processing, respecting sentence boundaries
+    and a maximum chunk character length.
+
+    Args:
+        full_text: The complete text to be chunked.
+        chunk_size: The desired maximum character length for each chunk.
+                    Sentences longer than this will form their own chunk.
+
+    Returns:
+        A list of text chunks, ready for TTS.
+    """
+    if not full_text or full_text.isspace():
+        return []
+    if chunk_size <= 0:
+        chunk_size = float("inf")
+
+    processed_segments = _preprocess_and_segment_text(full_text)
+    if not processed_segments:
+        return []
+
+    text_chunks: List[str] = []
+    current_chunk_sentences: List[str] = []
+    current_chunk_length = 0
+
+    for _, segment_text in processed_segments:
+        segment_len = len(segment_text)
+
+        if not current_chunk_sentences:
+            current_chunk_sentences.append(segment_text)
+            current_chunk_length = segment_len
+        elif current_chunk_length + 1 + segment_len <= chunk_size:
+            current_chunk_sentences.append(segment_text)
+            current_chunk_length += 1 + segment_len
+        else:
+            if current_chunk_sentences:
+                text_chunks.append(" ".join(current_chunk_sentences))
+            current_chunk_sentences = [segment_text]
+            current_chunk_length = segment_len
+
+        # Handle single segment exceeding chunk_size
+        if current_chunk_length > chunk_size and len(current_chunk_sentences) == 1:
+            text_chunks.append(" ".join(current_chunk_sentences))
+            current_chunk_sentences = []
+            current_chunk_length = 0
+
+    if current_chunk_sentences:
+        text_chunks.append(" ".join(current_chunk_sentences))
+
+    text_chunks = [chunk for chunk in text_chunks if chunk.strip()]
+
+    if not text_chunks and full_text.strip():
+        logger.warning(
+            "Text chunking resulted in zero chunks despite non-empty input. Returning full text as one chunk."
+        )
+        return [full_text.strip()]
+
+    return text_chunks
 
 
 class VoicePipeline:
@@ -45,6 +139,8 @@ class VoicePipeline:
         tts_ref_audio: str | None = None,
         tts_ref_text: str | None = None,
         tts_ref_audio_seconds: int = 15,
+        # Character-based chunking for TTS (0 = per-sentence, >0 = max chars per chunk)
+        tts_chunk_size: int = 200,
     ):
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
@@ -64,6 +160,7 @@ class VoicePipeline:
         self.tts_ref_audio = tts_ref_audio
         self.tts_ref_text = tts_ref_text
         self.tts_ref_audio_seconds = tts_ref_audio_seconds
+        self.tts_chunk_size = tts_chunk_size
 
         self.mlx_lock = asyncio.Lock()
 
@@ -88,7 +185,8 @@ class VoicePipeline:
             )
         elif self.tts_backend == "csm":
             self.tts = CSMTTS(
-                model_id="mlx-community/csm-1b-fp16",
+                # model_id="mlx-community/csm-1b-fp16",
+                model_id="Marvis-AI/marvis-tts-250m-v0.2",
                 ref_audio_path=self.tts_ref_audio,
                 ref_text=self.tts_ref_text,
                 ref_audio_seconds=self.tts_ref_audio_seconds,
@@ -101,6 +199,13 @@ class VoicePipeline:
                 model_id="mlx-community/chatterbox-turbo-4bit",
                 ref_audio_path=self.tts_ref_audio,
                 output_sample_rate=self.output_sample_rate,
+            )
+        elif self.tts_backend == "voxcpm":
+            self.tts = VoxCPMTTS(
+                model_id="mlx-community/VoxCPM1.5-fp16",
+                ref_audio_path=self.tts_ref_audio,
+                ref_text=self.tts_ref_text,
+                output_sample_rate=44_100,  # VoxCPM native sample rate
             )
         else:
             raise ValueError(f"Unknown TTS backend: {self.tts_backend}")
@@ -132,7 +237,10 @@ class VoicePipeline:
                 "content": (
                     "You are a helpful voice assistant. You always respond with short "
                     "sentences and never use punctuation like parentheses or colons "
-                    "that wouldn't appear in conversational speech."
+                    "that wouldn't appear in conversational speech. "
+                    "To add expressivity, you may use these paralinguistic cues in brackets: "
+                    "[laugh], [chuckle], [sigh], [gasp], [cough], [clear throat], "
+                    "[sniff], [groan], [shush]. Use only these cues naturally in context to enhance the conversational flow."
                 ),
             },
             {"role": "user", "content": text},
@@ -309,6 +417,7 @@ async def lifespan(app: FastAPI):
         silence_threshold=app.state.silence_threshold,
         silence_duration=app.state.silence_duration,
         streaming_interval=app.state.streaming_interval,
+        tts_chunk_size=app.state.tts_chunk_size,
         output_sample_rate=app.state.output_sample_rate,
     )
     await pipeline.init_models()
@@ -378,30 +487,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         cancel_event.clear()
 
-                        # ✅ Sentence-by-sentence alternation:
-                        # Generate sentence 1 → Speak sentence 1 → Generate sentence 2 → Speak sentence 2 → ...
+                        # ✅ Character-based chunking:
+                        # Collect sentences until chunk_size chars → TTS for better prosody
                         async def stream_sentences():
-                            sentence_num = 0
-                            async for sentence in pipeline.generate_response_sentences(
-                                transcription, cancel_event
-                            ):
-                                if cancel_event.is_set():
-                                    break
-
-                                sentence_num += 1
-                                logger.info(f"Sentence {sentence_num}: {sentence}")
-
-                                # Send the sentence text to client
-                                await websocket.send_text(
-                                    json.dumps({"type": "response", "text": sentence})
-                                )
-
-                                # Immediately TTS this sentence
+                            sentence_buffer = []
+                            current_length = 0
+                            chunk_size = pipeline.tts_chunk_size  # max chars per chunk (0 = per-sentence)
+                            
+                            async def tts_chunk(text):
+                                """TTS a chunk of text and send audio."""
                                 buffered = bytearray()
                                 started = False
-
+                                
                                 async for audio_chunk in pipeline.synthesize_speech(
-                                    sentence, cancel_event
+                                    text, cancel_event
                                 ):
                                     if cancel_event.is_set():
                                         break
@@ -435,7 +534,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                             )
                                         )
 
-                                # Flush any remaining buffered audio for this sentence
+                                # Flush remaining
                                 if buffered:
                                     await websocket.send_text(
                                         json.dumps(
@@ -447,6 +546,40 @@ async def websocket_endpoint(websocket: WebSocket):
                                             }
                                         )
                                     )
+                            
+                            async for sentence in pipeline.generate_response_sentences(
+                                transcription, cancel_event
+                            ):
+                                if cancel_event.is_set():
+                                    break
+
+                                logger.info(f"Sentence: {sentence}")
+                                sentence_buffer.append(sentence)
+
+                                # Send each sentence text to client immediately
+                                await websocket.send_text(
+                                    json.dumps({"type": "response", "text": sentence})
+                                )
+
+                                # TTS when we have enough characters (or per-sentence if chunk_size=0)
+                                sentence_len = len(sentence)
+                                current_length += sentence_len + (1 if sentence_buffer else 0)
+                                
+                                should_flush = (
+                                    chunk_size == 0  # per-sentence mode
+                                    or current_length >= chunk_size
+                                )
+                                
+                                if should_flush and sentence_buffer:
+                                    chunk_text = " ".join(sentence_buffer)
+                                    sentence_buffer.clear()
+                                    current_length = 0
+                                    await tts_chunk(chunk_text)
+
+                            # TTS any remaining sentences
+                            if sentence_buffer and not cancel_event.is_set():
+                                chunk_text = " ".join(sentence_buffer)
+                                await tts_chunk(chunk_text)
 
                             await websocket.send_text(json.dumps({"type": "audio_end"}))
 
@@ -481,15 +614,15 @@ def main():
     parser.add_argument(
         "--llm_model",
         type=str,
-        default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        default="mlx-community/Ministral-3-3B-Instruct-2512",
         help="LLM model",
     )
     parser.add_argument(
         "--tts_backend",
         type=str,
         default="kokoro",
-        choices=["kokoro", "csm", "chatterbox"],
-        help="TTS backend to use: kokoro, csm, or chatterbox",
+        choices=["kokoro", "csm", "chatterbox", "voxcpm"],
+        help="TTS backend to use: kokoro, csm, chatterbox, or voxcpm",
     )
     # Kokoro-specific args
     parser.add_argument(
@@ -539,6 +672,12 @@ def main():
         "--streaming_interval", type=int, default=3, help="Streaming interval"
     )
     parser.add_argument(
+        "--tts_chunk_size",
+        type=int,
+        default=200,
+        help="Max characters per TTS chunk (0 = per-sentence, higher = better prosody but more latency)",
+    )
+    parser.add_argument(
         "--output_sample_rate",
         type=int,
         default=24_000,
@@ -560,6 +699,7 @@ def main():
     app.state.silence_threshold = args.silence_threshold
     app.state.silence_duration = args.silence_duration
     app.state.streaming_interval = args.streaming_interval
+    app.state.tts_chunk_size = args.tts_chunk_size
     app.state.output_sample_rate = args.output_sample_rate
 
     uvicorn.run(app, host=args.host, port=args.port)
