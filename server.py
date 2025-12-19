@@ -23,8 +23,9 @@ class VoicePipeline:
     def __init__(
         self,
         stt_model="mlx-community/whisper-large-v3-turbo",
-        llm_model="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        tts_model="mlx-community/csm-1b-fp16",
+        # llm_model="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        llm_model="mistralai/Ministral-3-3B-Reasoning-2512-GGUF",
+        tts_model="mlx-community/csm-1b",
         output_sample_rate=24_000,
     ):
         self.stt_model = stt_model
@@ -167,7 +168,9 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Voice Pipeline Server")
     parser.add_argument("--stt_model", default="mlx-community/whisper-large-v3-turbo")
+    # parser.add_argument("--llm_model", default="mlx-community/Ministral-3-3B-Instruct-2512-4bit")
     parser.add_argument("--llm_model", default="mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+    # parser.add_argument("--llm_model", default="mistralai/Ministral-3-3B-Reasoning-2512-GGUF")
     parser.add_argument("--tts_model", default="mlx-community/csm-1b-fp16")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8765)
