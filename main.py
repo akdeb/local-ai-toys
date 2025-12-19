@@ -378,65 +378,43 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         cancel_event.clear()
 
-                        # ✅ Sentence-by-sentence alternation:
-                        # Generate sentence 1 → Speak sentence 1 → Generate sentence 2 → Speak sentence 2 → ...
-                        async def stream_sentences():
-                            sentence_num = 0
+                        # ✅ Full response first, then TTS:
+                        # Generate full LLM response → Send text → TTS entire response
+                        async def generate_then_speak():
+                            # Collect full response from LLM
+                            full_response = []
                             async for sentence in pipeline.generate_response_sentences(
                                 transcription, cancel_event
                             ):
                                 if cancel_event.is_set():
                                     break
+                                full_response.append(sentence)
+                                logger.info(f"Generated: {sentence}")
 
-                                sentence_num += 1
-                                logger.info(f"Sentence {sentence_num}: {sentence}")
+                            if cancel_event.is_set():
+                                return
 
-                                # Send the sentence text to client
-                                await websocket.send_text(
-                                    json.dumps({"type": "response", "text": sentence})
-                                )
+                            # Send full text to client
+                            full_text = " ".join(full_response)
+                            await websocket.send_text(
+                                json.dumps({"type": "response", "text": full_text})
+                            )
 
-                                # Immediately TTS this sentence
-                                buffered = bytearray()
-                                started = False
+                            # TTS the full response
+                            buffered = bytearray()
+                            started = False
 
-                                async for audio_chunk in pipeline.synthesize_speech(
-                                    sentence, cancel_event
-                                ):
-                                    if cancel_event.is_set():
-                                        break
+                            async for audio_chunk in pipeline.synthesize_speech(
+                                full_text, cancel_event
+                            ):
+                                if cancel_event.is_set():
+                                    break
 
-                                    if not started:
-                                        buffered.extend(audio_chunk)
-                                        if len(buffered) < PREBUFFER_BYTES:
-                                            continue
+                                if not started:
+                                    buffered.extend(audio_chunk)
+                                    if len(buffered) < PREBUFFER_BYTES:
+                                        continue
 
-                                        await websocket.send_text(
-                                            json.dumps(
-                                                {
-                                                    "type": "audio",
-                                                    "data": base64.b64encode(
-                                                        bytes(buffered)
-                                                    ).decode("utf-8"),
-                                                }
-                                            )
-                                        )
-                                        buffered.clear()
-                                        started = True
-                                    else:
-                                        await websocket.send_text(
-                                            json.dumps(
-                                                {
-                                                    "type": "audio",
-                                                    "data": base64.b64encode(
-                                                        audio_chunk
-                                                    ).decode("utf-8"),
-                                                }
-                                            )
-                                        )
-
-                                # Flush any remaining buffered audio for this sentence
-                                if buffered:
                                     await websocket.send_text(
                                         json.dumps(
                                             {
@@ -447,10 +425,36 @@ async def websocket_endpoint(websocket: WebSocket):
                                             }
                                         )
                                     )
+                                    buffered.clear()
+                                    started = True
+                                else:
+                                    await websocket.send_text(
+                                        json.dumps(
+                                            {
+                                                "type": "audio",
+                                                "data": base64.b64encode(
+                                                    audio_chunk
+                                                ).decode("utf-8"),
+                                            }
+                                        )
+                                    )
+
+                            # Flush any remaining buffered audio
+                            if buffered:
+                                await websocket.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "audio",
+                                            "data": base64.b64encode(
+                                                bytes(buffered)
+                                            ).decode("utf-8"),
+                                        }
+                                    )
+                                )
 
                             await websocket.send_text(json.dumps({"type": "audio_end"}))
 
-                        current_tts_task = asyncio.create_task(stream_sentences())
+                        current_tts_task = asyncio.create_task(generate_then_speak())
 
             elif msg_type == "cancel":
                 if current_tts_task and not current_tts_task.done():
