@@ -16,8 +16,7 @@ from mlx_lm.generate import generate_step
 from mlx_lm.utils import load as load_llm
 
 from mlx_audio.stt.models.whisper import Model as Whisper
-from mlx_audio.tts.utils import load_model as load_tts
-from mlx_audio.tts.generate import load_audio as load_tts_audio
+from tts import ChatterboxTTS, CSMTTS, KokoroTTS
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -36,10 +35,17 @@ class VoicePipeline:
         frame_duration_ms=30,
         stt_model="mlx-community/whisper-large-v3-turbo",
         llm_model="Qwen/Qwen2.5-0.5B-Instruct-4bit",
-        tts_model="mlx-community/csm-1b-fp16",
+        # TTS backend selection
+        tts_backend: str = "kokoro",
+        # Kokoro-specific
+        tts_model: str = "mlx-community/Kokoro-82M-bf16",
+        tts_voice: str = "af_heart",
+        tts_lang_code: str = "a",
+        tts_speed: float = 1.0,
+        # CSM-specific
         tts_ref_audio: str | None = None,
         tts_ref_text: str | None = None,
-        tts_ref_audio_seconds: int | None = None,
+        tts_ref_audio_seconds: int = 15,
     ):
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
@@ -48,12 +54,17 @@ class VoicePipeline:
         self.streaming_interval = streaming_interval
         self.frame_duration_ms = frame_duration_ms
 
-        self.stt_model = stt_model
+        self.stt_model_id = stt_model
         self.llm_model = llm_model
+        
+        # TTS config
+        self.tts_backend = tts_backend
         self.tts_model = tts_model
-        self._tts_ref_audio_path = tts_ref_audio
+        self.tts_voice = tts_voice
+        self.tts_lang_code = tts_lang_code
+        self.tts_speed = tts_speed
+        self.tts_ref_audio = tts_ref_audio
         self.tts_ref_text = tts_ref_text
-        self.tts_ref_audio = None  # Will be loaded as mx.array in init_models
         self.tts_ref_audio_seconds = tts_ref_audio_seconds
 
         self.mlx_lock = asyncio.Lock()
@@ -64,48 +75,45 @@ class VoicePipeline:
             lambda: load_llm(self.llm_model)
         )
 
-        logger.info(f"Loading text-to-speech model: {self.tts_model}")
-        self.tts = await asyncio.to_thread(lambda: load_tts(self.tts_model))
+        logger.info(f"Loading speech-to-text model: {self.stt_model_id}")
+        self.stt = Whisper.from_pretrained(self.stt_model_id)
 
-        logger.info(f"Loading speech-to-text model: {self.stt_model}")
-        self.stt = Whisper.from_pretrained(self.stt_model)
-
-        # Load reference audio for voice cloning if provided
-        if self._tts_ref_audio_path:
-            logger.info(f"Loading TTS reference audio: {self._tts_ref_audio_path}")
-            self.tts_ref_audio = load_tts_audio(
-                self._tts_ref_audio_path,
-                sample_rate=self.tts.sample_rate,
-                segment_duration=self.tts_ref_audio_seconds,
+        # Initialize TTS backend
+        logger.info(f"Loading TTS backend: {self.tts_backend} ({self.tts_model})")
+        if self.tts_backend == "kokoro":
+            self.tts = KokoroTTS(
+                model_id=self.tts_model,
+                voice=self.tts_voice,
+                lang_code=self.tts_lang_code,
+                speed=self.tts_speed,
+                output_sample_rate=self.output_sample_rate,
             )
-            # Auto-transcribe ref_audio if ref_text not provided
-            if not self.tts_ref_text:
-                logger.info("Transcribing reference audio...")
-                result = self.stt.generate(self.tts_ref_audio)
-                self.tts_ref_text = result.text.strip()
-                logger.info(f"Reference text: {self.tts_ref_text}")
+        elif self.tts_backend == "csm":
+            self.tts = CSMTTS(
+                model_id=self.tts_model,
+                ref_audio_path=self.tts_ref_audio,
+                ref_text=self.tts_ref_text,
+                ref_audio_seconds=self.tts_ref_audio_seconds,
+                output_sample_rate=self.output_sample_rate,
+                streaming_interval=self.streaming_interval,
+                stt_model=self.stt,
+            )
+        elif self.tts_backend == "chatterbox":
+            self.tts = ChatterboxTTS(
+                model_id=self.tts_model,
+                ref_audio_path=self.tts_ref_audio,
+                output_sample_rate=self.output_sample_rate,
+            )
+        else:
+            raise ValueError(f"Unknown TTS backend: {self.tts_backend}")
 
-        # ✅ Warm up TTS once at startup to avoid first-utterance garble
+        await asyncio.to_thread(self.tts.load)
+
+        # ✅ Warm up TTS once at startup
         logger.info("Warming up TTS...")
         async with self.mlx_lock:
-            await asyncio.to_thread(self._warmup_tts)
+            await asyncio.to_thread(self.tts.warmup)
         logger.info("TTS warmup done.")
-
-    def _warmup_tts(self):
-        generate_kwargs = {
-            "sample_rate": self.output_sample_rate,
-            "stream": True,
-            "streaming_interval": self.streaming_interval,
-            "verbose": False,
-        }
-        if self.tts_ref_audio is not None:
-            generate_kwargs["ref_audio"] = self.tts_ref_audio
-        if self.tts_ref_text:
-            generate_kwargs["ref_text"] = self.tts_ref_text
-
-        # Generate a short utterance and discard output (forces MLX allocations/JIT/kernels)
-        for _chunk in self.tts.generate("testing", **generate_kwargs):
-            pass
 
     async def transcribe(self, audio_bytes: bytes) -> str:
         audio = (
@@ -243,21 +251,11 @@ class VoicePipeline:
         loop = asyncio.get_running_loop()
 
         def _tts_stream():
-            generate_kwargs = {
-                "sample_rate": self.output_sample_rate,
-                "stream": True,
-                "streaming_interval": self.streaming_interval,
-                "verbose": False,
-            }
-            if self.tts_ref_audio is not None:
-                generate_kwargs["ref_audio"] = self.tts_ref_audio
-            if self.tts_ref_text:
-                generate_kwargs["ref_text"] = self.tts_ref_text
-
-            for chunk in self.tts.generate(text, **generate_kwargs):
+            # TTS wrapper already returns int16 PCM bytes
+            for audio_bytes in self.tts.generate(text):
                 if cancel_event and cancel_event.is_set():
                     break
-                loop.call_soon_threadsafe(audio_queue.put_nowait, chunk.audio)
+                loop.call_soon_threadsafe(audio_queue.put_nowait, audio_bytes)
             loop.call_soon_threadsafe(audio_queue.put_nowait, None)
 
         async with self.mlx_lock:
@@ -269,12 +267,7 @@ class VoicePipeline:
                         break
                     if cancel_event and cancel_event.is_set():
                         break
-
-                    # ✅ Convert float audio to int16 safely (clip to avoid overflow garble)
-                    audio_np = np.asarray(chunk, dtype=np.float32)
-                    audio_np = np.clip(audio_np, -1.0, 1.0)
-                    audio_int16 = (audio_np * 32767.0).astype(np.int16)
-                    yield audio_int16.tobytes()
+                    yield chunk
             finally:
                 await tts_task
 
@@ -307,8 +300,12 @@ async def lifespan(app: FastAPI):
     global pipeline
     pipeline = VoicePipeline(
         stt_model=app.state.stt_model,
-        tts_model=app.state.tts_model,
         llm_model=app.state.llm_model,
+        tts_backend=app.state.tts_backend,
+        tts_model=app.state.tts_model,
+        tts_voice=app.state.tts_voice,
+        tts_lang_code=app.state.tts_lang_code,
+        tts_speed=app.state.tts_speed,
         tts_ref_audio=app.state.tts_ref_audio,
         tts_ref_text=app.state.tts_ref_text,
         tts_ref_audio_seconds=app.state.tts_ref_audio_seconds,
@@ -485,31 +482,61 @@ def main():
         help="STT model",
     )
     parser.add_argument(
-        "--tts_model", type=str, default="mlx-community/csm-1b-fp16", help="TTS model"
-    )
-    parser.add_argument(
         "--llm_model",
         type=str,
         default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
         help="LLM model",
     )
     parser.add_argument(
+        "--tts_backend",
+        type=str,
+        default="kokoro",
+        choices=["kokoro", "csm", "chatterbox"],
+        help="TTS backend to use: kokoro, csm, or chatterbox",
+    )
+    parser.add_argument(
+        "--tts_model",
+        type=str,
+        default=None,
+        help="TTS model (auto-selected based on backend if not specified)",
+    )
+    # Kokoro-specific args
+    parser.add_argument(
+        "--tts_voice",
+        type=str,
+        default="af_heart",
+        help="[Kokoro] Voice to use (e.g. af_heart, af_bella, am_adam)",
+    )
+    parser.add_argument(
+        "--tts_lang_code",
+        type=str,
+        default="a",
+        help="[Kokoro] Language code (a=American English, b=British English)",
+    )
+    parser.add_argument(
+        "--tts_speed",
+        type=float,
+        default=1.0,
+        help="TTS speech speed multiplier",
+    )
+    # CSM-specific args
+    parser.add_argument(
         "--tts_ref_audio",
         type=str,
         default=None,
-        help="Optional reference audio WAV path for voice cloning",
-    )
-    parser.add_argument(
-        "--tts_ref_audio_seconds",
-        type=int,
-        default=15,
-        help="Seconds of reference audio to use (CSM has a max context; keep this small)",
+        help="[CSM] Reference audio WAV path for voice cloning",
     )
     parser.add_argument(
         "--tts_ref_text",
         type=str,
         default=None,
-        help="Optional reference caption for the reference audio",
+        help="[CSM] Reference text (auto-transcribed if not provided)",
+    )
+    parser.add_argument(
+        "--tts_ref_audio_seconds",
+        type=int,
+        default=15,
+        help="[CSM] Seconds of reference audio to use",
     )
     parser.add_argument(
         "--silence_duration", type=float, default=1.5, help="Silence duration"
@@ -530,9 +557,22 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     args = parser.parse_args()
 
+    # Auto-select TTS model based on backend if not specified
+    if args.tts_model is None:
+        if args.tts_backend == "kokoro":
+            args.tts_model = "mlx-community/Kokoro-82M-bf16"
+        elif args.tts_backend == "csm":
+            args.tts_model = "mlx-community/csm-1b-fp16"
+        elif args.tts_backend == "chatterbox":
+            args.tts_model = "mlx-community/chatterbox-turbo-4bit"
+
     app.state.stt_model = args.stt_model
-    app.state.tts_model = args.tts_model
     app.state.llm_model = args.llm_model
+    app.state.tts_backend = args.tts_backend
+    app.state.tts_model = args.tts_model
+    app.state.tts_voice = args.tts_voice
+    app.state.tts_lang_code = args.tts_lang_code
+    app.state.tts_speed = args.tts_speed
     app.state.tts_ref_audio = args.tts_ref_audio
     app.state.tts_ref_text = args.tts_ref_text
     app.state.tts_ref_audio_seconds = args.tts_ref_audio_seconds
