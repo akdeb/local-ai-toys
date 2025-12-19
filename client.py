@@ -3,6 +3,8 @@ import asyncio
 import base64
 import json
 import threading
+import wave
+from pathlib import Path
 
 import numpy as np
 import pyaudio
@@ -15,8 +17,18 @@ FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000)
 OUTPUT_SAMPLE_RATE = 24000
 
 
+def get_next_session_path() -> Path:
+    """Find next available session file (session1.wav, session2.wav, etc.)"""
+    i = 1
+    while True:
+        path = Path(f"session{i}.wav")
+        if not path.exists():
+            return path
+        i += 1
+
+
 class VoiceClient:
-    def __init__(self, server_url: str, vad_aggressiveness: int = 3):
+    def __init__(self, server_url: str, vad_aggressiveness: int = 3, record: bool = False):
         self.server_url = server_url
         self.vad = webrtcvad.Vad(vad_aggressiveness)
         self.audio = pyaudio.PyAudio()
@@ -27,6 +39,10 @@ class VoiceClient:
         self.speech_started = False
         self.silence_frames = 0
         self.silence_threshold = 30  # ~900ms of silence to end speech
+        
+        # Session recording
+        self.record = record
+        self.session_audio: list[bytes] = []  # Stores all audio (input + output)
 
     def start_mic_stream(self):
         return self.audio.open(
@@ -89,6 +105,9 @@ class VoiceClient:
                         print("⏳ Processing...")
                         self.mic_muted = True
                         
+                        if self.record:
+                            self.session_audio.append(bytes(self.audio_buffer))
+                        
                         await ws.send(json.dumps({
                             "type": "audio",
                             "data": base64.b64encode(bytes(self.audio_buffer)).decode(),
@@ -120,6 +139,15 @@ class VoiceClient:
                 elif msg_type == "audio":
                     audio_bytes = base64.b64decode(data["data"])
                     speaker_stream.write(audio_bytes)
+                    if self.record:
+                        # Resample output to input rate for consistent recording
+                        audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+                        # Simple resample from OUTPUT_SAMPLE_RATE to SAMPLE_RATE
+                        ratio = SAMPLE_RATE / OUTPUT_SAMPLE_RATE
+                        new_len = int(len(audio_np) * ratio)
+                        indices = np.linspace(0, len(audio_np) - 1, new_len).astype(int)
+                        resampled = audio_np[indices].tobytes()
+                        self.session_audio.append(resampled)
 
                 elif msg_type == "audio_end":
                     print("✅ Ready\n")
@@ -132,10 +160,20 @@ class VoiceClient:
     def cleanup(self):
         self.running = False
         self.audio.terminate()
+        
+        # Save session recording
+        if self.record and self.session_audio:
+            session_path = get_next_session_path()
+            with wave.open(str(session_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(b"".join(self.session_audio))
+            print(f"📼 Session saved to {session_path}")
 
 
 async def main(args):
-    client = VoiceClient(args.server, args.vad_level)
+    client = VoiceClient(args.server, args.vad_level, args.record)
     try:
         await client.run()
     except KeyboardInterrupt:
@@ -149,6 +187,8 @@ if __name__ == "__main__":
     parser.add_argument("--server", default="ws://localhost:8765")
     parser.add_argument("--vad_level", type=int, default=3, choices=[0, 1, 2, 3],
                         help="VAD aggressiveness (0-3, higher = more aggressive)")
+    parser.add_argument("--record", action="store_true",
+                        help="Record session to WAV file (session1.wav, session2.wav, etc.)")
     args = parser.parse_args()
 
     asyncio.run(main(args))

@@ -1,2 +1,5 @@
 .venv
 *.wav
+tts/__pycache__/*
+*.pyc
+*.log

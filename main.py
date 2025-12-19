@@ -38,7 +38,6 @@ class VoicePipeline:
         # TTS backend selection
         tts_backend: str = "kokoro",
         # Kokoro-specific
-        tts_model: str = "mlx-community/Kokoro-82M-bf16",
         tts_voice: str = "af_heart",
         tts_lang_code: str = "a",
         tts_speed: float = 1.0,
@@ -59,7 +58,6 @@ class VoicePipeline:
         
         # TTS config
         self.tts_backend = tts_backend
-        self.tts_model = tts_model
         self.tts_voice = tts_voice
         self.tts_lang_code = tts_lang_code
         self.tts_speed = tts_speed
@@ -79,10 +77,10 @@ class VoicePipeline:
         self.stt = Whisper.from_pretrained(self.stt_model_id)
 
         # Initialize TTS backend
-        logger.info(f"Loading TTS backend: {self.tts_backend} ({self.tts_model})")
+        logger.info(f"Loading TTS backend: {self.tts_backend}")
         if self.tts_backend == "kokoro":
             self.tts = KokoroTTS(
-                model_id=self.tts_model,
+                model_id="mlx-community/Kokoro-82M-bf16",
                 voice=self.tts_voice,
                 lang_code=self.tts_lang_code,
                 speed=self.tts_speed,
@@ -90,7 +88,7 @@ class VoicePipeline:
             )
         elif self.tts_backend == "csm":
             self.tts = CSMTTS(
-                model_id=self.tts_model,
+                model_id="mlx-community/csm-1b-fp16",
                 ref_audio_path=self.tts_ref_audio,
                 ref_text=self.tts_ref_text,
                 ref_audio_seconds=self.tts_ref_audio_seconds,
@@ -100,7 +98,7 @@ class VoicePipeline:
             )
         elif self.tts_backend == "chatterbox":
             self.tts = ChatterboxTTS(
-                model_id=self.tts_model,
+                model_id="mlx-community/chatterbox-turbo-4bit",
                 ref_audio_path=self.tts_ref_audio,
                 output_sample_rate=self.output_sample_rate,
             )
@@ -302,7 +300,6 @@ async def lifespan(app: FastAPI):
         stt_model=app.state.stt_model,
         llm_model=app.state.llm_model,
         tts_backend=app.state.tts_backend,
-        tts_model=app.state.tts_model,
         tts_voice=app.state.tts_voice,
         tts_lang_code=app.state.tts_lang_code,
         tts_speed=app.state.tts_speed,
@@ -494,12 +491,6 @@ def main():
         choices=["kokoro", "csm", "chatterbox"],
         help="TTS backend to use: kokoro, csm, or chatterbox",
     )
-    parser.add_argument(
-        "--tts_model",
-        type=str,
-        default=None,
-        help="TTS model (auto-selected based on backend if not specified)",
-    )
     # Kokoro-specific args
     parser.add_argument(
         "--tts_voice",
@@ -557,19 +548,9 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     args = parser.parse_args()
 
-    # Auto-select TTS model based on backend if not specified
-    if args.tts_model is None:
-        if args.tts_backend == "kokoro":
-            args.tts_model = "mlx-community/Kokoro-82M-bf16"
-        elif args.tts_backend == "csm":
-            args.tts_model = "mlx-community/csm-1b-fp16"
-        elif args.tts_backend == "chatterbox":
-            args.tts_model = "mlx-community/chatterbox-turbo-4bit"
-
     app.state.stt_model = args.stt_model
     app.state.llm_model = args.llm_model
     app.state.tts_backend = args.tts_backend
-    app.state.tts_model = args.tts_model
     app.state.tts_voice = args.tts_voice
     app.state.tts_lang_code = args.tts_lang_code
     app.state.tts_speed = args.tts_speed

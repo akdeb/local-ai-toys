@@ -9,6 +9,9 @@ from .base import BaseTTS
 class ChatterboxTTS(BaseTTS):
     """Chatterbox Turbo TTS backend with voice cloning support."""
 
+    # Chunk size in samples (~100ms at 24kHz = 2400 samples)
+    CHUNK_SAMPLES = 2400
+
     def __init__(
         self,
         model_id: str = "mlx-community/chatterbox-turbo-4bit",
@@ -49,7 +52,11 @@ class ChatterboxTTS(BaseTTS):
             audio_np = np.asarray(chunk.audio, dtype=np.float32)
             audio_np = np.clip(audio_np, -1.0, 1.0)
             audio_int16 = (audio_np * 32767.0).astype(np.int16)
-            yield audio_int16.tobytes()
+            
+            # Chunk the audio to avoid WebSocket message size limits
+            for i in range(0, len(audio_int16), self.CHUNK_SAMPLES):
+                audio_chunk = audio_int16[i:i + self.CHUNK_SAMPLES]
+                yield audio_chunk.tobytes()
 
     def warmup(self) -> None:
         """Warm up the TTS model."""
